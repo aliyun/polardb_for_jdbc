@@ -652,9 +652,13 @@ public class TypeInfoCache implements TypeInfo {
     }
     try (ResourceLock ignore = lock.obtain()) {
       if (getCompositeFieldOidsStatement == null) {
+        // POLAR: exclude PolarDB's built-in hidden ROWID column (positive attnum, not dropped):
+        // the server never includes it in the composite wire format, and a record literal
+        // with a value for it is rejected ("malformed record literal: Too many columns").
         String sql = "SELECT a.atttypid FROM pg_catalog.pg_attribute a"
             + " JOIN pg_catalog.pg_type t ON t.typrelid = a.attrelid"
             + " WHERE t.oid = ? AND a.attnum > 0 AND NOT a.attisdropped"
+            + " AND a.attname <> 'polar_sys_rowid_attr'"
             + " ORDER BY a.attnum";
         getCompositeFieldOidsStatement = conn.prepareStatement(sql);
       }
@@ -698,9 +702,13 @@ public class TypeInfoCache implements TypeInfo {
     }
     try (ResourceLock ignore = lock.obtain()) {
       if (getCompositeFieldDescStatement == null) {
+        // POLAR: exclude PolarDB's built-in hidden ROWID column the same way as
+        // getCompositeFieldTypeOids above, so frameworks driven by
+        // getCompositeTypeFields see exactly the user columns the server serializes.
         String sql = "SELECT a.attname, a.atttypid, a.attnum FROM pg_catalog.pg_attribute a"
             + " JOIN pg_catalog.pg_type t ON t.typrelid = a.attrelid"
             + " WHERE t.oid = ? AND a.attnum > 0 AND NOT a.attisdropped"
+            + " AND a.attname <> 'polar_sys_rowid_attr'"
             + " ORDER BY a.attnum";
         getCompositeFieldDescStatement = conn.prepareStatement(sql);
       }
