@@ -1817,7 +1817,8 @@ class PgPreparedStatement extends PgStatement implements PreparedStatement {
   }
 
   public void setNString(@Positive int parameterIndex, @Nullable String value) throws SQLException {
-    throw Driver.notImplemented(this.getClass(), "setNString(int, String)");
+    // PolarDB maps NVARCHAR to VARCHAR, so national character strings use the normal string path.
+    setString(parameterIndex, value);
   }
 
   public void setNCharacterStream(@Positive int parameterIndex, @Nullable Reader value, long length)

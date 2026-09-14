@@ -1598,4 +1598,28 @@ public class PreparedStatementTest extends BaseTest4 {
       // ignore
     }
   }
+
+  @Test
+  public void testSetNString() throws SQLException {
+    String[] values = {
+        "plain ASCII text",
+        "special !@#$%^&*()_+-=[]{}|;:'\",.<>/?\\`~\\n\\t",
+        "中文：你好，世界",
+        "日本語：こんにちは世界",
+        "العربية: مرحبا بالعالم",
+        "Русский: Привет, мир",
+        "emoji: 😀🚀"
+    };
+    try (PreparedStatement ps = con.prepareStatement("select ? as value")) {
+      for (String value : values) {
+        ps.setNString(1, value);
+        try (ResultSet rs = ps.executeQuery()) {
+          assertTrue(rs.next());
+          assertEquals(value, rs.getNString(1));
+          assertEquals(value, rs.getNString("value"));
+          assertEquals(value, rs.getString(1));
+        }
+      }
+    }
+  }
 }
