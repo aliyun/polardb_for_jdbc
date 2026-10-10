@@ -24,6 +24,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.CallableStatement;
@@ -37,9 +38,16 @@ import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.sql.Types;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.ZoneOffset;
 import java.util.Calendar;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 
 class PgCallableStatement extends PgPreparedStatement implements CallableStatement {
   // Used by the callablestatement style methods
@@ -62,6 +70,9 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
   // POLAR: stores the type name provided to registerOutParameter(index, ARRAY, typeName)
   // used when converting Types.OTHER String values back to the correct Array type
   private @Nullable String @Nullable [] functionReturnTypeName;
+  // POLAR: JDBC column type of each stored OUT value (parallel to callResult), used by
+  // getObject(int, Class) to pick instant vs wall-clock semantics for OffsetDateTime
+  private int @Nullable [] callResultColumnType;
   // returnTypeSet is true when a proper call to registerOutParameter has been made
   private boolean returnTypeSet;
   protected @Nullable Object @Nullable [] callResult;
@@ -237,6 +248,7 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
         lastIndex = 0;
         int resultSize = doBlockResultSize();
         this.callResult = new Object[resultSize];
+        this.callResultColumnType = new int[resultSize];
         return false;
       }
 
@@ -249,6 +261,7 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
         lastIndex = 0;
         int resultSize = doBlockResultSize();
         this.callResult = new Object[resultSize];
+        this.callResultColumnType = new int[resultSize];
         return false;
       }
 
@@ -295,6 +308,8 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
       int resultSize = doBlockResultSize();
       @Nullable Object[] callResult = new Object[resultSize];
       this.callResult = callResult;
+      int[] callResultColumnType = new int[resultSize];
+      this.callResultColumnType = callResultColumnType;
 
       if (isDoBlock) {
         /* POLAR: For DO anonymous blocks, result set columns correspond to $1, $2, ...
@@ -304,6 +319,7 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
           int paramIdx = i; // 0-based index into callResult
           callResult[paramIdx] = rs.getObject(i + 1);
           int columnType = rs.getMetaData().getColumnType(i + 1);
+          callResultColumnType[paramIdx] = columnType;
           int registeredType = functionReturnType[paramIdx];
           String typeName = functionReturnTypeName != null ? functionReturnTypeName[paramIdx] : null;
           if (registeredType != 0 && columnType != registeredType) {
@@ -349,6 +365,7 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
 
           callResult[j] = rs.getObject(i + 1);
           int columnType = rs.getMetaData().getColumnType(i + 1);
+          callResultColumnType[j] = columnType;
           String typeName = functionReturnTypeName != null ? functionReturnTypeName[j] : null;
 
           // POLAR: Skip type conversion for unregistered slots (functionReturnType[j]==0)
@@ -1465,11 +1482,274 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
 
   public <T> @Nullable T getObject(@Positive int parameterIndex, Class<T> type)
       throws SQLException {
+    if (type == null) {
+      throw new PSQLException(GT.tr("type is null"), PSQLState.INVALID_PARAMETER_VALUE);
+    }
     if (type == ResultSet.class) {
       return type.cast(getObject(parameterIndex));
     }
-    throw new PSQLException(GT.tr("Unsupported type conversion to {1}.", type),
-            PSQLState.INVALID_PARAMETER_VALUE);
+    /* POLAR: typed read of an OUT parameter (e.g. cs.getObject(1, LocalDate.class)).
+     * Previously only ResultSet.class was accepted and every other target raised
+     * "Unsupported type conversion", which breaks generic DAO helpers that read OUT
+     * parameters by Java class. Convert the stored call result to the requested class. */
+    Object value = getCallResult(parameterIndex);
+    if (value == null) {
+      return null;
+    }
+    if (type.isInstance(value)) {
+      return type.cast(value);
+    }
+    Object converted = convertCallResultToType(value, type, callResultColumnType(parameterIndex));
+    if (converted == null) {
+      throw new PSQLException(GT.tr("Unsupported type conversion to {0}.", type),
+          PSQLState.INVALID_PARAMETER_VALUE);
+    }
+    return type.cast(converted);
+  }
+
+  /**
+   * POLAR: Converts a stored OUT parameter value to the class requested through
+   * {@link #getObject(int, Class)}, mirroring the conversions accepted by
+   * {@link PgResultSet#getObject(int, Class)} so both read paths behave alike.
+   *
+   * @param value the raw value stored in callResult (never null)
+   * @param type the requested target class
+   * @param columnType the JDBC column type the OUT value was returned as (0 if unknown)
+   * @return the converted value, or null when no conversion applies
+   * @throws SQLException if parsing a textual value fails
+   */
+  private @Nullable Object convertCallResultToType(Object value, Class<?> type, int columnType)
+      throws SQLException {
+    // ---- character target: textual representation of any value ----
+    if (type == String.class) {
+      return value.toString();
+    }
+
+    // ---- boolean target ----
+    if (type == Boolean.class) {
+      if (value instanceof String) {
+        return Boolean.parseBoolean(((String) value).trim());
+      }
+      BigDecimal flag = toNumericValue(value);
+      return flag == null ? null : flag.intValue() != 0;
+    }
+
+    // ---- numeric targets ----
+    if (type == BigDecimal.class || type == BigInteger.class || type == Integer.class
+        || type == Long.class || type == Short.class || type == Byte.class
+        || type == Float.class || type == Double.class) {
+      BigDecimal numeric = toNumericValue(value);
+      if (numeric == null) {
+        return null;
+      }
+      if (type == BigInteger.class) {
+        return numeric.toBigInteger();
+      }
+      if (type == Integer.class) {
+        return numeric.intValue();
+      }
+      if (type == Long.class) {
+        return numeric.longValue();
+      }
+      if (type == Short.class) {
+        return numeric.shortValue();
+      }
+      if (type == Byte.class) {
+        return numeric.byteValue();
+      }
+      if (type == Float.class) {
+        return numeric.floatValue();
+      }
+      if (type == Double.class) {
+        return numeric.doubleValue();
+      }
+      return numeric;
+    }
+
+    // ---- date/time targets ----
+    if (type == LocalDate.class || type == LocalTime.class || type == LocalDateTime.class
+        || type == OffsetDateTime.class || type == OffsetTime.class
+        || type == Timestamp.class || type == java.sql.Date.class || type == Time.class
+        || type == java.util.Date.class || type == Calendar.class) {
+      return convertTemporalValue(value, type, columnType);
+    }
+
+    if (type == UUID.class) {
+      try {
+        return UUID.fromString(value.toString());
+      } catch (IllegalArgumentException e) {
+        return null;
+      }
+    }
+
+    // ---- large objects ----
+    if (type == Blob.class && value instanceof byte[]) {
+      return new PgBlobBytea((byte[]) value);
+    }
+    if ((type == Clob.class || type == NClob.class) && value instanceof String) {
+      return new PgClobText((String) value);
+    }
+
+    return null;
+  }
+
+  /**
+   * POLAR: Projects a temporal OUT value (java.sql.Timestamp/Date/Time or a textual
+   * representation of one) onto the requested java.sql / java.time / Calendar target.
+   *
+   * @param value the raw value stored in callResult (never null)
+   * @param type the requested temporal class
+   * @param columnType the JDBC column type the OUT value was returned as (0 if unknown)
+   * @return the converted value, or null when the source value is not temporal
+   * @throws SQLException if parsing a textual value fails
+   */
+  private @Nullable Object convertTemporalValue(Object value, Class<?> type, int columnType)
+      throws SQLException {
+    Timestamp ts = null;
+    java.sql.Date dt = null;
+    Time tm = null;
+    if (value instanceof Timestamp) {
+      ts = (Timestamp) value;
+    } else if (value instanceof java.sql.Date) {
+      dt = (java.sql.Date) value;
+    } else if (value instanceof Time) {
+      tm = (Time) value;
+    } else if (value instanceof String) {
+      // DB column was textual: parse with the same utils the getters use
+      String str = ((String) value).trim();
+      if (type == LocalTime.class || type == OffsetTime.class || type == Time.class) {
+        tm = getTimestampUtils().toTime(null, str);
+      } else if (type == LocalDate.class || type == java.sql.Date.class) {
+        dt = getTimestampUtils().toDate(null, str);
+      } else {
+        ts = getTimestampUtils().toTimestamp(null, str);
+      }
+    } else {
+      return null;
+    }
+
+    if (type == LocalDate.class) {
+      if (dt != null) {
+        return dt.toLocalDate();
+      }
+      return ts == null ? null : ts.toLocalDateTime().toLocalDate();
+    }
+    if (type == LocalTime.class) {
+      if (tm != null) {
+        return tm.toLocalTime();
+      }
+      return ts == null ? null : ts.toLocalDateTime().toLocalTime();
+    }
+    if (type == LocalDateTime.class) {
+      if (ts != null) {
+        return ts.toLocalDateTime();
+      }
+      return dt == null ? null : dt.toLocalDate().atStartOfDay();
+    }
+    if (type == OffsetDateTime.class) {
+      if (value instanceof String) {
+        // mirror PgResultSet: take the offset from the text, then normalize to UTC
+        OffsetDateTime odt = getTimestampUtils().toOffsetDateTime((String) value);
+        if (odt == OffsetDateTime.MAX || odt == OffsetDateTime.MIN) {
+          return odt;
+        }
+        return odt.withOffsetSameInstant(ZoneOffset.UTC);
+      }
+      if (ts != null) {
+        // timestamptz holds a true instant; plain timestamp holds wall-clock time
+        if (columnType == Types.TIMESTAMP_WITH_TIMEZONE) {
+          return ts.toInstant().atOffset(ZoneOffset.UTC);
+        }
+        return ts.toLocalDateTime().atOffset(ZoneOffset.UTC);
+      }
+      return dt == null ? null : dt.toLocalDate().atStartOfDay().atOffset(ZoneOffset.UTC);
+    }
+    if (type == OffsetTime.class) {
+      if (value instanceof String) {
+        // mirror PgResultSet: timetz text carries the offset
+        return getTimestampUtils().toOffsetTime((String) value);
+      }
+      if (tm != null) {
+        return tm.toLocalTime().atOffset(ZoneOffset.UTC);
+      }
+      return ts == null ? null : ts.toLocalDateTime().toLocalTime().atOffset(ZoneOffset.UTC);
+    }
+    if (type == Timestamp.class) {
+      if (ts != null) {
+        return ts;
+      }
+      if (dt != null) {
+        return new Timestamp(dt.getTime());
+      }
+      return tm == null ? null : new Timestamp(tm.getTime());
+    }
+    if (type == java.sql.Date.class) {
+      if (dt != null) {
+        return dt;
+      }
+      return ts == null ? null : new java.sql.Date(ts.getTime());
+    }
+    if (type == Time.class) {
+      if (tm != null) {
+        return tm;
+      }
+      return ts == null ? null : new Time(ts.getTime());
+    }
+    if (type == java.util.Date.class) {
+      if (ts != null) {
+        return new java.util.Date(ts.getTime());
+      }
+      if (dt != null) {
+        return new java.util.Date(dt.getTime());
+      }
+      return tm == null ? null : new java.util.Date(tm.getTime());
+    }
+    // Calendar target
+    if (ts == null && dt == null && tm == null) {
+      return null;
+    }
+    Calendar calendar = Calendar.getInstance(
+        getTimestampUtils().getSharedCalendar(null).getTimeZone());
+    long millis = ts != null ? ts.getTime() : (dt != null ? dt.getTime() : tm.getTime());
+    calendar.setTimeInMillis(millis);
+    return calendar;
+  }
+
+  /**
+   * POLAR: Returns the JDBC column type stored for an OUT parameter slot.
+   *
+   * @param parameterIndex 1-based parameter index
+   * @return the column type, or 0 when unknown
+   */
+  private int callResultColumnType(@Positive int parameterIndex) {
+    int[] columnTypes = this.callResultColumnType;
+    if (columnTypes == null || parameterIndex < 1 || parameterIndex > columnTypes.length) {
+      return 0;
+    }
+    return columnTypes[parameterIndex - 1];
+  }
+
+  /**
+   * POLAR: Represents a numeric-family OUT value (Number or numeric text) as BigDecimal.
+   *
+   * @param value the raw value stored in callResult (never null)
+   * @return the value as BigDecimal, or null when it is not numeric
+   */
+  private static @Nullable BigDecimal toNumericValue(Object value) {
+    try {
+      if (value instanceof BigDecimal) {
+        return (BigDecimal) value;
+      }
+      if (value instanceof Number) {
+        return new BigDecimal(value.toString());
+      }
+      if (value instanceof String) {
+        return new BigDecimal(((String) value).trim());
+      }
+    } catch (NumberFormatException e) {
+      return null;
+    }
+    return null;
   }
 
   public <T> @Nullable T getObject(String parameterName, Class<T> type) throws SQLException {
