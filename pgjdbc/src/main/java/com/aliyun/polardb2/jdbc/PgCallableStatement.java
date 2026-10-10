@@ -8,6 +8,7 @@ package com.aliyun.polardb2.jdbc;
 import static com.aliyun.polardb2.util.internal.Nullness.castNonNull;
 
 import com.aliyun.polardb2.Driver;
+import com.aliyun.polardb2.PGStatement;
 import com.aliyun.polardb2.core.Field;
 import com.aliyun.polardb2.core.Oid;
 import com.aliyun.polardb2.core.ParameterList;
@@ -1522,16 +1523,36 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
       throws SQLException {
     // ---- character target: textual representation of any value ----
     if (type == String.class) {
-      return value.toString();
+      if (value instanceof byte[]) {
+        // byte[].toString() returns "[B@..." which is useless; encode as hex instead
+        byte[] bytes = (byte[]) value;
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+          sb.append(String.format("%02x", b & 0xff));
+        }
+        return sb.toString();
+      }
+      if (value instanceof String || value instanceof Number
+          || value instanceof java.util.Date || value instanceof Boolean
+          || value instanceof PGobject) {
+        return value.toString();
+      }
+      // Unsupported source type for String conversion – return null to trigger
+      // "Unsupported type conversion" rather than silently returning garbage
+      return null;
     }
 
     // ---- boolean target ----
     if (type == Boolean.class) {
-      if (value instanceof String) {
-        return Boolean.parseBoolean(((String) value).trim());
+      // Reuse BooleanTypeUtil so that "t", "1", "Y", "yes", "on" etc. are handled
+      // consistently with getBoolean(int) which also delegates to this utility.
+      try {
+        return BooleanTypeUtil.castToBoolean(value);
+      } catch (PSQLException e) {
+        // castToBoolean throws CANNOT_COERCE when the value is unrecognized;
+        // surface it as-is rather than masking it behind "Unsupported type conversion"
+        throw e;
       }
-      BigDecimal flag = toNumericValue(value);
-      return flag == null ? null : flag.intValue() != 0;
     }
 
     // ---- numeric targets ----
@@ -1575,10 +1596,12 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
     }
 
     if (type == UUID.class) {
+      String uuidStr = value.toString();
       try {
-        return UUID.fromString(value.toString());
+        return UUID.fromString(uuidStr);
       } catch (IllegalArgumentException e) {
-        return null;
+        throw new PSQLException(GT.tr("Bad value for type {0} : {1}", "uuid", uuidStr),
+            PSQLState.INVALID_PARAMETER_VALUE);
       }
     }
 
@@ -1586,8 +1609,11 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
     if (type == Blob.class && value instanceof byte[]) {
       return new PgBlobBytea((byte[]) value);
     }
-    if ((type == Clob.class || type == NClob.class) && value instanceof String) {
+    if (type == Clob.class && value instanceof String) {
       return new PgClobText((String) value);
+    }
+    if (type == NClob.class) {
+      throw Driver.notImplemented(this.getClass(), "getObject(int, NClob.class)");
     }
 
     return null;
@@ -1629,6 +1655,17 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
     }
 
     if (type == LocalDate.class) {
+      long millis = dt != null ? dt.getTime() : (ts != null ? ts.getTime() : Long.MIN_VALUE);
+      if (millis != Long.MIN_VALUE) {
+        if (millis == PGStatement.DATE_POSITIVE_INFINITY
+            || millis == PGStatement.DATE_POSITIVE_SMALLER_INFINITY) {
+          return LocalDate.MAX;
+        }
+        if (millis == PGStatement.DATE_NEGATIVE_INFINITY
+            || millis == PGStatement.DATE_NEGATIVE_SMALLER_INFINITY) {
+          return LocalDate.MIN;
+        }
+      }
       if (dt != null) {
         return dt.toLocalDate();
       }
@@ -1641,6 +1678,17 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
       return ts == null ? null : ts.toLocalDateTime().toLocalTime();
     }
     if (type == LocalDateTime.class) {
+      long millis = ts != null ? ts.getTime() : (dt != null ? dt.getTime() : Long.MIN_VALUE);
+      if (millis != Long.MIN_VALUE) {
+        if (millis == PGStatement.DATE_POSITIVE_INFINITY
+            || millis == PGStatement.DATE_POSITIVE_SMALLER_INFINITY) {
+          return LocalDateTime.MAX;
+        }
+        if (millis == PGStatement.DATE_NEGATIVE_INFINITY
+            || millis == PGStatement.DATE_NEGATIVE_SMALLER_INFINITY) {
+          return LocalDateTime.MIN;
+        }
+      }
       if (ts != null) {
         return ts.toLocalDateTime();
       }
@@ -1656,13 +1704,34 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
         return odt.withOffsetSameInstant(ZoneOffset.UTC);
       }
       if (ts != null) {
+        long millis = ts.getTime();
+        if (millis == PGStatement.DATE_POSITIVE_INFINITY
+            || millis == PGStatement.DATE_POSITIVE_SMALLER_INFINITY) {
+          return OffsetDateTime.MAX;
+        }
+        if (millis == PGStatement.DATE_NEGATIVE_INFINITY
+            || millis == PGStatement.DATE_NEGATIVE_SMALLER_INFINITY) {
+          return OffsetDateTime.MIN;
+        }
         // timestamptz holds a true instant; plain timestamp holds wall-clock time
         if (columnType == Types.TIMESTAMP_WITH_TIMEZONE) {
           return ts.toInstant().atOffset(ZoneOffset.UTC);
         }
         return ts.toLocalDateTime().atOffset(ZoneOffset.UTC);
       }
-      return dt == null ? null : dt.toLocalDate().atStartOfDay().atOffset(ZoneOffset.UTC);
+      if (dt != null) {
+        long millis = dt.getTime();
+        if (millis == PGStatement.DATE_POSITIVE_INFINITY
+            || millis == PGStatement.DATE_POSITIVE_SMALLER_INFINITY) {
+          return OffsetDateTime.MAX;
+        }
+        if (millis == PGStatement.DATE_NEGATIVE_INFINITY
+            || millis == PGStatement.DATE_NEGATIVE_SMALLER_INFINITY) {
+          return OffsetDateTime.MIN;
+        }
+        return dt.toLocalDate().atStartOfDay().atOffset(ZoneOffset.UTC);
+      }
+      return null;
     }
     if (type == OffsetTime.class) {
       if (value instanceof String) {
@@ -1733,22 +1802,32 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
    * POLAR: Represents a numeric-family OUT value (Number or numeric text) as BigDecimal.
    *
    * @param value the raw value stored in callResult (never null)
-   * @return the value as BigDecimal, or null when it is not numeric
+   * @return the value as BigDecimal, or null when the source type is not numeric at all
+   * @throws PSQLException when the value looks numeric/textual but cannot be parsed
    */
-  private static @Nullable BigDecimal toNumericValue(Object value) {
-    try {
-      if (value instanceof BigDecimal) {
-        return (BigDecimal) value;
-      }
-      if (value instanceof Number) {
-        return new BigDecimal(value.toString());
-      }
-      if (value instanceof String) {
-        return new BigDecimal(((String) value).trim());
-      }
-    } catch (NumberFormatException e) {
-      return null;
+  private static @Nullable BigDecimal toNumericValue(Object value) throws PSQLException {
+    if (value instanceof BigDecimal) {
+      return (BigDecimal) value;
     }
+    if (value instanceof Number) {
+      try {
+        return new BigDecimal(value.toString());
+      } catch (NumberFormatException e) {
+        throw new PSQLException(
+            GT.tr("Bad value for type {0} : {1}", "BigDecimal", value),
+            PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    }
+    if (value instanceof String) {
+      try {
+        return new BigDecimal(((String) value).trim());
+      } catch (NumberFormatException e) {
+        throw new PSQLException(
+            GT.tr("Bad value for type {0} : {1}", "BigDecimal", value),
+            PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    }
+    // Not a recognizable numeric source type – caller will report "unsupported conversion"
     return null;
   }
 
