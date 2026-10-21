@@ -4,15 +4,19 @@
 
 package com.aliyun.polardb2.test.polarora;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import com.aliyun.polardb2.test.TestUtil;
 
 import org.junit.After;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Properties;
@@ -162,5 +166,109 @@ public class ErrorCodeTest {
       // No error occurred, this test just verifies normal operation
       assertTrue(true);
     }
+  }
+
+  /**
+   * POLAR: Skips the tests below unless the server runs in Oracle compatibility
+   * mode and reports the SQLCODE protocol field.
+   */
+  private void assumeOraSqlCodeSupported() throws SQLException {
+    try (Statement stmt = conn.createStatement();
+         ResultSet rs = stmt.executeQuery(
+             "SELECT count(*) FROM pg_catalog.pg_settings WHERE name IN "
+                 + "('polar_compatibility_mode', 'polar_enable_ora_sqlcode') "
+                 + "AND ((name = 'polar_compatibility_mode' AND setting = 'ora') "
+                 + "  OR (name = 'polar_enable_ora_sqlcode' AND setting = 'on'))")) {
+      rs.next();
+      Assume.assumeTrue("server is not in Oracle mode with polar_enable_ora_sqlcode on",
+          rs.getInt(1) == 2);
+    }
+  }
+
+  /**
+   * POLAR: Runs a statement that must fail and returns the error number the
+   * driver reports for it.
+   */
+  private int errorCodeOf(String sql) throws SQLException {
+    try (Statement stmt = conn.createStatement()) {
+      stmt.execute(sql);
+    } catch (SQLException e) {
+      return e.getErrorCode();
+    }
+    fail("expected an error from: " + sql);
+    return 0;
+  }
+
+  /**
+   * POLAR: NO_DATA_FOUND is reported by the server as SQLCODE +100, which is
+   * what PL/SQL sees, but ojdbc exposes it as the error number 1403. The driver
+   * has to perform that conversion or migrated applications stop matching.
+   */
+  @Test
+  public void testNoDataFoundReports1403() throws SQLException {
+    assumeOraSqlCodeSupported();
+    assertEquals("NO_DATA_FOUND must report error number 1403",
+        1403, errorCodeOf("DECLARE v NUMBER; BEGIN SELECT 1 INTO v FROM dual WHERE 1=0; END;"));
+  }
+
+  /**
+   * POLAR: An unhandled user-defined exception is reported by the server as
+   * SQLCODE +1, but ojdbc exposes it as the error number 6510.
+   */
+  @Test
+  public void testUserDefinedExceptionReports6510() throws SQLException {
+    assumeOraSqlCodeSupported();
+    assertEquals("an unhandled user-defined exception must report error number 6510",
+        6510, errorCodeOf("DECLARE e_my EXCEPTION; BEGIN RAISE e_my; END;"));
+  }
+
+  /**
+   * POLAR: A unique violation is reported by the server as SQLCODE -1, so it
+   * must keep reporting error number 1 and must not be confused with the +1 of
+   * a user-defined exception.
+   */
+  @Test
+  public void testDuplicateKeyReports1Not6510() throws SQLException {
+    assumeOraSqlCodeSupported();
+    String tableName = "test_dup_key_" + System.currentTimeMillis();
+    try (Statement stmt = conn.createStatement()) {
+      stmt.execute("CREATE TABLE " + tableName + " (id INT PRIMARY KEY)");
+      stmt.execute("INSERT INTO " + tableName + " VALUES (1)");
+      assertEquals("a unique violation must report error number 1",
+          1, errorCodeOf("INSERT INTO " + tableName + " VALUES (1)"));
+    } finally {
+      try (Statement stmt = conn.createStatement()) {
+        stmt.execute("DROP TABLE IF EXISTS " + tableName);
+      } catch (SQLException ignored) {
+      }
+    }
+  }
+
+  /**
+   * POLAR: EXCEPTION_INIT binds a user exception to an Oracle error number, so
+   * raising it reports that number's negated SQLCODE rather than +1.
+   */
+  @Test
+  public void testExceptionInitReportsBoundNumber() throws SQLException {
+    assumeOraSqlCodeSupported();
+    assertEquals("EXCEPTION_INIT(e, -1) must report error number 1",
+        1, errorCodeOf("DECLARE e_dup EXCEPTION; PRAGMA EXCEPTION_INIT(e_dup, -1); "
+            + "BEGIN RAISE e_dup; END;"));
+  }
+
+  /**
+   * POLAR: Negative SQLCODEs keep reporting their magnitude, matching ojdbc.
+   */
+  @Test
+  public void testNegativeSqlCodesMatchOracle() throws SQLException {
+    assumeOraSqlCodeSupported();
+    assertEquals("ZERO_DIVIDE must report error number 1476",
+        1476, errorCodeOf("DECLARE v NUMBER; BEGIN v := 1/0; END;"));
+    assertEquals("VALUE_ERROR must report error number 6502",
+        6502, errorCodeOf("DECLARE v VARCHAR2(3); BEGIN v := 'abcdef'; END;"));
+    assertEquals("a missing relation must report error number 942",
+        942, errorCodeOf("SELECT * FROM no_such_table_zx"));
+    assertEquals("RAISE_APPLICATION_ERROR must report the number it was given",
+        20001, errorCodeOf("BEGIN RAISE_APPLICATION_ERROR(-20001, 'boom'); END;"));
   }
 }

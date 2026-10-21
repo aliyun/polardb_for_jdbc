@@ -37,6 +37,19 @@ public class ServerErrorMessage implements Serializable {
   private static final Character CONSTRAINT = 'n';
   private static final Character SQLCODE = 'E';
 
+  /*
+   * POLAR: the server reports the 'E' field using the PL/SQL SQLCODE
+   * convention, where NO_DATA_FOUND is +100 and an unhandled user-defined
+   * exception is +1. JDBC's getErrorCode() must instead report the ORA-nnnnn
+   * error number, where those two are 1403 and 6510. The kernel cannot emit
+   * the error number because the same value backs PL/SQL's SQLCODE, so the
+   * conversion belongs here.
+   */
+  private static final int SQLCODE_NO_DATA_FOUND = 100;
+  private static final int SQLCODE_USER_DEFINED = 1;
+  private static final int ERROR_NUMBER_NO_DATA_FOUND = 1403;
+  private static final int ERROR_NUMBER_USER_DEFINED = 6510;
+
   private final Map<Character, String> mesgParts = new HashMap<Character, String>();
 
   public ServerErrorMessage(EncodingPredictor.DecodeResult serverError) {
@@ -70,17 +83,25 @@ public class ServerErrorMessage implements Serializable {
   }
 
   public @Nullable int getErrorCode() {
+    int sqlCode;
     try {
-      int sqlCode = Integer.parseInt(mesgParts.get(SQLCODE));
-      /* POLAR: Convert negative SQLCODE to positive to match Oracle convention.
-       * PostgreSQL uses negative codes (e.g., -1, -203), while Oracle uses positive (e.g., 1, 942).
-       * We take the absolute value to provide Oracle-compatible error codes. */
-      return Math.abs(sqlCode);
+      sqlCode = Integer.parseInt(mesgParts.get(SQLCODE));
     } catch (NumberFormatException e) {
-        // parse error
+      // no 'E' field, or a value we cannot parse
+      return 0;
     }
 
-    return 0;
+    if (sqlCode == SQLCODE_NO_DATA_FOUND) {
+      return ERROR_NUMBER_NO_DATA_FOUND;
+    }
+    if (sqlCode == SQLCODE_USER_DEFINED) {
+      return ERROR_NUMBER_USER_DEFINED;
+    }
+    /*
+     * POLAR: every other SQLCODE is negative, and its ORA-nnnnn error number
+     * is the magnitude.
+     */
+    return Math.abs(sqlCode);
   }
 
   public @Nullable String getSQLState() {
