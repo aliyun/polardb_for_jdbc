@@ -430,8 +430,9 @@ public enum PostgresqlObjectId implements Type, PostgresTypeIdentifier {
 
     /**
      * PolarDB date array object id.
+     * Uses OID 9008 to stay consistent with the PolarDB JDBC driver (Oid.ORADATE_ARRAY = 9008).
      */
-    POLARDB_DATE_ARRAY(9003, LocalDate[].class);
+    POLARDB_DATE_ARRAY(9008, LocalDate[].class);
 
     public static final int OID_CACHE_SIZE = 9010; // POLARDB_DATE_ARRAY is currently the highest one
 
