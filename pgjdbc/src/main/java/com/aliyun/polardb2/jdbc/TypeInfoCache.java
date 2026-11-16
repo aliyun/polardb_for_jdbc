@@ -79,6 +79,14 @@ public class TypeInfoCache implements TypeInfo {
   private @Nullable PreparedStatement getOidStatementSimple;
   private @Nullable PreparedStatement getOidStatementComplexNonArray;
   private @Nullable PreparedStatement getOidStatementComplexArray;
+  // POLAR: prepared statements for 3-part (schema.pkg.type) and package-aware 2-part lookups
+  private @Nullable PreparedStatement getOidStatementPkgNonArray;
+  private @Nullable PreparedStatement getOidStatementPkgArray;
+  private @Nullable PreparedStatement getOidStatementDottedNonArray;
+  private @Nullable PreparedStatement getOidStatementDottedArray;
+  private @Nullable PreparedStatement getOidStatementNoMatch;
+  private @Nullable PreparedStatement checkPackageNamespaceStatement;
+  private @Nullable Boolean packageNamespaceSupported;
   private @Nullable PreparedStatement getNameStatement;
   private @Nullable PreparedStatement getArrayElementOidStatement;
   private @Nullable PreparedStatement getArrayElementByTyparrayStatement;
@@ -88,9 +96,13 @@ public class TypeInfoCache implements TypeInfo {
   private @Nullable PreparedStatement findCollectionByElementStmt;
   // POLAR: prepared statement for SELECT typcategory FROM pg_type WHERE oid = ?
   private @Nullable PreparedStatement getTypeCategoryStatement;
-  // POLAR: prepared statement for synonym resolution
+  // POLAR: prepared statements for synonym resolution
   private @Nullable PreparedStatement resolveSynonymStatement;
+  private @Nullable PreparedStatement resolveSynonymQualifiedStatement;
+  private @Nullable PreparedStatement checkAllSynonymsStatement;
+  private @Nullable Boolean allSynonymsPresent;
   private boolean synonymLookupSupported = true; // set to false if all_synonyms doesn't exist
+  private static final int MAX_SYNONYM_DEPTH = 4;
   // POLAR: composite type OID -> field type OIDs (ordered by attnum). Cache for
   // getCompositeFieldTypeOids so composite record fields can be type-restored.
   private final Map<Integer, int @Nullable []> oidToCompositeFieldOids =
@@ -441,6 +453,236 @@ public class TypeInfoCache implements TypeInfo {
     }
   }
 
+  /**
+   * POLAR: Checks once per connection whether {@code pg_catalog.pg_namespace}
+   * exposes {@code nsppkgns} (PolarDB embedded package namespaces). Querying
+   * {@code pg_attribute} avoids SQL errors inside an active transaction when
+   * connected to standard PostgreSQL servers.
+   */
+  private boolean hasPackageNamespaceSupport() throws SQLException {
+    if (packageNamespaceSupported != null) {
+      return packageNamespaceSupported;
+    }
+    if (checkPackageNamespaceStatement == null) {
+      checkPackageNamespaceStatement = conn.prepareStatement(
+          "SELECT 1 FROM pg_catalog.pg_attribute "
+          + "WHERE attrelid = 'pg_catalog.pg_namespace'::regclass "
+          + "AND attname = 'nsppkgns' AND NOT attisdropped LIMIT 1");
+    }
+    boolean supported = false;
+    if (((BaseStatement) checkPackageNamespaceStatement)
+        .executeWithFlags(QueryExecutor.QUERY_SUPPRESS_BEGIN)) {
+      ResultSet rs = castNonNull(checkPackageNamespaceStatement.getResultSet());
+      try {
+        supported = rs.next();
+      } finally {
+        rs.close();
+      }
+    }
+    packageNamespaceSupported = supported;
+    return supported;
+  }
+
+  /**
+   * POLAR: Splits a possibly qualified type name into 1..3 normalized
+   * identifier parts while respecting double-quoted identifiers (e.g.
+   * {@code "Evil.Table"}, {@code CAS.PKG_CRR.TBL_CRR_CALLBACK_RESULT},
+   * {@code "CAS"."PKG_CRR"."TBL_CRR_CALLBACK_RESULT"}). Unquoted parts are
+   * folded to lower case; quoted parts preserve exact case and unescape
+   * {@code ""}. Returns {@code null} for malformed or >3-part names.
+   */
+  static String @Nullable [] parseQualifiedTypeName(String fullName) {
+    if (fullName.isEmpty()) {
+      return null;
+    }
+    List<String> parts = new ArrayList<String>(3);
+    StringBuilder current = new StringBuilder();
+    boolean inQuotes = false;
+    boolean wasQuoted = false;
+    for (int i = 0; i < fullName.length(); i++) {
+      char c = fullName.charAt(i);
+      if (inQuotes) {
+        if (c == '"') {
+          if (i + 1 < fullName.length() && fullName.charAt(i + 1) == '"') {
+            current.append('"');
+            i++;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          current.append(c);
+        }
+      } else if (c == '"') {
+        if (current.length() > 0) {
+          return null;
+        }
+        inQuotes = true;
+        wasQuoted = true;
+      } else if (c == '.') {
+        if (!wasQuoted && current.length() == 0) {
+          return null;
+        }
+        parts.add(wasQuoted ? current.toString() : current.toString().toLowerCase(Locale.ROOT));
+        if (parts.size() >= 3) {
+          return null;
+        }
+        current.setLength(0);
+        wasQuoted = false;
+      } else {
+        if (wasQuoted) {
+          return null;
+        }
+        current.append(c);
+      }
+    }
+    if (inQuotes || (!wasQuoted && current.length() == 0)) {
+      return null;
+    }
+    parts.add(wasQuoted ? current.toString() : current.toString().toLowerCase(Locale.ROOT));
+    return parts.toArray(new String[0]);
+  }
+
+  private static String quoteIdent(String ident) {
+    return "\"" + ident.replace("\"", "\"\"") + "\"";
+  }
+
+  private static String formatQualifiedName(
+      @Nullable String pkgSchema, String schema, String name) {
+    if (pkgSchema != null) {
+      return quoteIdent(pkgSchema) + "." + quoteIdent(schema) + "." + quoteIdent(name);
+    }
+    return quoteIdent(schema) + "." + quoteIdent(name);
+  }
+
+  private PreparedStatement prepareNoMatchStatement() throws SQLException {
+    if (getOidStatementNoMatch == null) {
+      getOidStatementNoMatch = conn.prepareStatement(
+          "SELECT NULL::oid, NULL::name WHERE false");
+    }
+    return getOidStatementNoMatch;
+  }
+
+  private PreparedStatement prepareComplexOidStatement(boolean isArray) throws SQLException {
+    if (isArray) {
+      if (getOidStatementComplexArray == null) {
+        String sql;
+        if (conn.haveMinimumServerVersion(ServerVersion.v8_3)) {
+          sql = "SELECT t.typarray, arr.typname "
+              + "  FROM pg_catalog.pg_type t"
+              + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+              + "  JOIN pg_catalog.pg_type arr ON arr.oid = t.typarray"
+              + " WHERE t.typname = ? AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))"
+              + " ORDER BY t.oid DESC LIMIT 1";
+        } else {
+          sql = "SELECT t.oid, t.typname "
+              + "  FROM pg_catalog.pg_type t"
+              + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+              + " WHERE t.typelem = (SELECT oid FROM pg_catalog.pg_type WHERE typname = ?)"
+              + " AND substring(t.typname, 1, 1) = '_' AND t.typlen = -1"
+              + " AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))"
+              + " ORDER BY t.typelem DESC LIMIT 1";
+        }
+        getOidStatementComplexArray = conn.prepareStatement(sql);
+      }
+      return getOidStatementComplexArray;
+    }
+    if (getOidStatementComplexNonArray == null) {
+      String sql = "SELECT t.oid, t.typname "
+          + "  FROM pg_catalog.pg_type t"
+          + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+          + " WHERE t.typname = ? AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))"
+          + " ORDER BY t.oid DESC LIMIT 1";
+      getOidStatementComplexNonArray = conn.prepareStatement(sql);
+    }
+    return getOidStatementComplexNonArray;
+  }
+
+  private PreparedStatement prepareDottedOidStatement(boolean isArray) throws SQLException {
+    String searchPathJoin =
+        " LEFT JOIN ("
+        + "   SELECT ns.oid AS nspoid, r.r"
+        + "     FROM pg_catalog.pg_namespace ns"
+        + "     JOIN ("
+        + "       SELECT s.r, (pg_catalog.current_schemas(false))[s.r] AS nspname"
+        + "         FROM pg_catalog.generate_series(1, pg_catalog.array_upper(pg_catalog.current_schemas(false), 1)) AS s(r)"
+        + "     ) AS r ON ns.nspname = r.nspname AND ns.nsppkgns = 0"
+        + " ) AS sp ON sp.nspoid = p.oid";
+    String orderBy =
+        " ORDER BY CASE WHEN n.nsppkgns = 0 THEN 0"
+        + "              WHEN sp.r IS NOT NULL THEN 1"
+        + "              ELSE 2 END,"
+        + "          sp.r,"
+        + "          t.oid DESC"
+        + " LIMIT 1";
+    if (isArray) {
+      if (getOidStatementDottedArray == null) {
+        String sql = "SELECT t.typarray, "
+            + "CASE WHEN p.nspname IS NOT NULL THEN "
+            + "'\"' || replace(p.nspname, '\"', '\"\"') || '\".\"' "
+            + "|| replace(n.nspname, '\"', '\"\"') || '\".\"' "
+            + "|| replace(arr.typname, '\"', '\"\"') || '\"' "
+            + "ELSE arr.typname END"
+            + "  FROM pg_catalog.pg_type t"
+            + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+            + "  JOIN pg_catalog.pg_type arr ON arr.oid = t.typarray"
+            + "  LEFT JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid"
+            + searchPathJoin
+            + " WHERE t.typname = ? AND n.nspname = ?"
+            + orderBy;
+        getOidStatementDottedArray = conn.prepareStatement(sql);
+      }
+      return getOidStatementDottedArray;
+    }
+    if (getOidStatementDottedNonArray == null) {
+      String sql = "SELECT t.oid, "
+          + "CASE WHEN p.nspname IS NOT NULL THEN "
+          + "'\"' || replace(p.nspname, '\"', '\"\"') || '\".\"' "
+          + "|| replace(n.nspname, '\"', '\"\"') || '\".\"' "
+          + "|| replace(t.typname, '\"', '\"\"') || '\"' "
+          + "ELSE t.typname END"
+          + "  FROM pg_catalog.pg_type t"
+          + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+          + "  LEFT JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid"
+          + searchPathJoin
+          + " WHERE t.typname = ? AND n.nspname = ?"
+          + orderBy;
+      getOidStatementDottedNonArray = conn.prepareStatement(sql);
+    }
+    return getOidStatementDottedNonArray;
+  }
+
+  private PreparedStatement preparePackageOidStatement(boolean isArray) throws SQLException {
+    if (isArray) {
+      if (getOidStatementPkgArray == null) {
+        String sql = "SELECT t.typarray, "
+            + "'\"' || replace(p.nspname, '\"', '\"\"') || '\".\"' "
+            + "|| replace(n.nspname, '\"', '\"\"') || '\".\"' "
+            + "|| replace(arr.typname, '\"', '\"\"') || '\"'"
+            + "  FROM pg_catalog.pg_type t"
+            + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+            + "  JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid"
+            + "  JOIN pg_catalog.pg_type arr ON arr.oid = t.typarray"
+            + " WHERE t.typname = ? AND n.nspname = ? AND p.nspname = ?"
+            + " ORDER BY t.oid DESC LIMIT 1";
+        getOidStatementPkgArray = conn.prepareStatement(sql);
+      }
+      return getOidStatementPkgArray;
+    }
+    if (getOidStatementPkgNonArray == null) {
+      String sql = "SELECT t.oid, "
+          + "'\"' || replace(p.nspname, '\"', '\"\"') || '\".\"' "
+          + "|| replace(n.nspname, '\"', '\"\"') || '\".\"' "
+          + "|| replace(t.typname, '\"', '\"\"') || '\"'"
+          + "  FROM pg_catalog.pg_type t"
+          + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+          + "  JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid"
+          + " WHERE t.typname = ? AND n.nspname = ? AND p.nspname = ?"
+          + " ORDER BY t.oid DESC LIMIT 1";
+      getOidStatementPkgNonArray = conn.prepareStatement(sql);
+    }
+    return getOidStatementPkgNonArray;
+  }
+
   private PreparedStatement getOidStatement(String pgTypeName) throws SQLException {
     boolean isArray = pgTypeName.endsWith("[]");
     boolean hasQuote = pgTypeName.contains("\"");
@@ -472,75 +714,36 @@ public class TypeInfoCache implements TypeInfo {
       getOidStatementSimple.setString(1, lcName);
       return getOidStatementSimple;
     }
-    PreparedStatement oidStatementComplex;
-    if (isArray) {
-      if (getOidStatementComplexArray == null) {
-        String sql;
-        if (conn.haveMinimumServerVersion(ServerVersion.v8_3)) {
-          sql = "SELECT t.typarray, arr.typname "
-              + "  FROM pg_catalog.pg_type t"
-              + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
-              + "  JOIN pg_catalog.pg_type arr ON arr.oid = t.typarray"
-              + " WHERE t.typname = ? AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))"
-              + " ORDER BY t.oid DESC LIMIT 1";
-        } else {
-          sql = "SELECT t.oid, t.typname "
-              + "  FROM pg_catalog.pg_type t"
-              + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
-              + " WHERE t.typelem = (SELECT oid FROM pg_catalog.pg_type WHERE typname = ?)"
-              + " AND substring(t.typname, 1, 1) = '_' AND t.typlen = -1"
-              + " AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))"
-              + " ORDER BY t.typelem DESC LIMIT 1";
-        }
-        getOidStatementComplexArray = conn.prepareStatement(sql);
-      }
-      oidStatementComplex = getOidStatementComplexArray;
-    } else {
-      if (getOidStatementComplexNonArray == null) {
-        String sql = "SELECT t.oid, t.typname "
-            + "  FROM pg_catalog.pg_type t"
-            + "  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
-            + " WHERE t.typname = ? AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))"
-            + " ORDER BY t.oid DESC LIMIT 1";
-        getOidStatementComplexNonArray = conn.prepareStatement(sql);
-      }
-      oidStatementComplex = getOidStatementComplexNonArray;
-    }
-    //type name requested may be schema specific, of the form "{schema}"."typeName",
-    //or may check across all schemas where a schema is not specified.
+
     String fullName = isArray ? pgTypeName.substring(0, pgTypeName.length() - 2) : pgTypeName;
-    String schema;
-    String name;
-    // simple use case
-    if (dotIndex == -1) {
-      schema = null;
-      name = fullName;
-    } else {
-      if (fullName.startsWith("\"")) {
-        if (fullName.endsWith("\"")) {
-          String[] parts = fullName.split("\"\\.\"");
-          schema = parts.length == 2 ? parts[0] + "\"" : null;
-          name = parts.length == 2 ? "\"" + parts[1] : parts[0];
-        } else {
-          int lastDotIndex = fullName.lastIndexOf('.');
-          name = fullName.substring(lastDotIndex + 1);
-          schema = fullName.substring(0, lastDotIndex);
-        }
-      } else {
-        schema = fullName.substring(0, dotIndex);
-        name = fullName.substring(dotIndex + 1);
+    String @Nullable [] parts = parseQualifiedTypeName(fullName);
+    if (parts == null) {
+      return prepareNoMatchStatement();
+    }
+
+    if (parts.length == 3) {
+      if (!hasPackageNamespaceSupport()
+          || (isArray && !conn.haveMinimumServerVersion(ServerVersion.v8_3))) {
+        return prepareNoMatchStatement();
       }
+      PreparedStatement pkgStmt = preparePackageOidStatement(isArray);
+      pkgStmt.setString(1, parts[2]);
+      pkgStmt.setString(2, parts[1]);
+      pkgStmt.setString(3, parts[0]);
+      return pkgStmt;
     }
-    if (schema != null && schema.startsWith("\"") && schema.endsWith("\"")) {
-      schema = schema.substring(1, schema.length() - 1);
-    } else if (schema != null) {
-      schema = schema.toLowerCase(Locale.ROOT);
+
+    if (parts.length == 2 && hasPackageNamespaceSupport()
+        && (!isArray || conn.haveMinimumServerVersion(ServerVersion.v8_3))) {
+      PreparedStatement dottedStmt = prepareDottedOidStatement(isArray);
+      dottedStmt.setString(1, parts[1]);
+      dottedStmt.setString(2, parts[0]);
+      return dottedStmt;
     }
-    if (name.startsWith("\"") && name.endsWith("\"")) {
-      name = name.substring(1, name.length() - 1);
-    } else {
-      name = name.toLowerCase(Locale.ROOT);
-    }
+
+    PreparedStatement oidStatementComplex = prepareComplexOidStatement(isArray);
+    String schema = parts.length == 2 ? parts[0] : null;
+    String name = parts.length == 2 ? parts[1] : parts[0];
     oidStatementComplex.setString(1, name);
     oidStatementComplex.setString(2, schema);
     oidStatementComplex.setBoolean(3, schema == null);
@@ -548,6 +751,10 @@ public class TypeInfoCache implements TypeInfo {
   }
 
   public int getPGType(String pgTypeName) throws SQLException {
+    return getPGType(pgTypeName, 0);
+  }
+
+  private int getPGType(String pgTypeName, int synonymDepth) throws SQLException {
     try (ResourceLock ignore = lock.obtain()) {
       // there really isn't anything else to return other than UNSPECIFIED here.
       if (pgTypeName == null) {
@@ -578,12 +785,14 @@ public class TypeInfoCache implements TypeInfo {
 
       // POLAR: Synonym fallback — if pg_type lookup returned nothing, try resolving
       // the name through Oracle-compatible synonyms (all_synonyms view).
-      // This supports the pattern: CREATE SYNONYM syn_name FOR real_type_name;
-      if (oid == Oid.UNSPECIFIED) {
+      // Supports standalone synonyms (syn_name), schema-qualified synonyms
+      // (schema.syn_name), and package-level synonyms (pkg_syn.type_name /
+      // schema.pkg_syn.type_name).
+      if (oid == Oid.UNSPECIFIED && synonymDepth < MAX_SYNONYM_DEPTH) {
         String resolvedName = resolveSynonym(pgTypeName);
-        if (resolvedName != null) {
+        if (resolvedName != null && !resolvedName.equals(pgTypeName)) {
           // Recurse with the resolved real type name
-          oid = getPGType(resolvedName);
+          oid = getPGType(resolvedName, synonymDepth + 1);
         }
       }
 
@@ -593,40 +802,123 @@ public class TypeInfoCache implements TypeInfo {
     }
   }
 
+  private boolean hasAllSynonymsSupport() throws SQLException {
+    if (!synonymLookupSupported) {
+      return false;
+    }
+    if (allSynonymsPresent != null) {
+      return allSynonymsPresent;
+    }
+    if (checkAllSynonymsStatement == null) {
+      checkAllSynonymsStatement = conn.prepareStatement(
+          "SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'all_synonyms' LIMIT 1");
+    }
+    boolean present = false;
+    if (((BaseStatement) checkAllSynonymsStatement)
+        .executeWithFlags(QueryExecutor.QUERY_SUPPRESS_BEGIN)) {
+      ResultSet rs = castNonNull(checkAllSynonymsStatement.getResultSet());
+      try {
+        present = rs.next();
+      } finally {
+        rs.close();
+      }
+    }
+    allSynonymsPresent = present;
+    if (!present) {
+      synonymLookupSupported = false;
+    }
+    return present;
+  }
+
   /**
-   * POLAR: Resolve a synonym name to the real type name it points to.
-   * Uses Oracle-compatible all_synonyms view. If the view doesn't exist
-   * (non-Oracle mode), this method is permanently disabled for the connection.
+   * POLAR: Resolve a synonym name (or synonym-qualified package type name)
+   * to the real type name it points to using {@code all_synonyms}.
    *
-   * @param synonymName the synonym name to resolve
+   * @param synonymName the type or synonym name to resolve
    * @return the real type name, or null if not a synonym / view unavailable
    */
   private @Nullable String resolveSynonym(String synonymName) throws SQLException {
-    if (!synonymLookupSupported) {
+    if (!hasAllSynonymsSupport()) {
       return null;
     }
-    try {
-      if (resolveSynonymStatement == null) {
-        // all_synonyms stores names in UPPER CASE (Oracle convention).
-        // Use LOWER() on both sides for case-insensitive matching.
-        String sql = "SELECT LOWER(table_name) FROM all_synonyms"
-            + " WHERE LOWER(synonym_name) = ? LIMIT 1";
-        resolveSynonymStatement = conn.prepareStatement(sql);
+    boolean isArray = synonymName.endsWith("[]");
+    String baseName = isArray ? synonymName.substring(0, synonymName.length() - 2) : synonymName;
+    String @Nullable [] parts = parseQualifiedTypeName(baseName);
+    if (parts == null) {
+      return null;
+    }
+    String resolved = null;
+    if (parts.length == 1) {
+      resolved = lookupSynonym(null, parts[0].toLowerCase(Locale.ROOT));
+    } else if (parts.length == 2) {
+      // First try schema.synonym; if not found, treat part[0] as a synonym for a package.
+      resolved = lookupSynonym(parts[0].toLowerCase(Locale.ROOT), parts[1].toLowerCase(Locale.ROOT));
+      if (resolved == null) {
+        String pkgTarget = lookupSynonym(null, parts[0].toLowerCase(Locale.ROOT));
+        if (pkgTarget != null) {
+          resolved = pkgTarget + "." + quoteIdent(parts[1]);
+        }
       }
-      resolveSynonymStatement.setString(1, synonymName.toLowerCase(Locale.ROOT));
-      if (!((BaseStatement) resolveSynonymStatement)
-          .executeWithFlags(QueryExecutor.QUERY_SUPPRESS_BEGIN)) {
+    } else if (parts.length == 3) {
+      String pkgTarget = lookupSynonym(
+          parts[0].toLowerCase(Locale.ROOT), parts[1].toLowerCase(Locale.ROOT));
+      if (pkgTarget != null) {
+        resolved = pkgTarget + "." + quoteIdent(parts[2]);
+      }
+    }
+    if (resolved != null && isArray) {
+      return resolved + "[]";
+    }
+    return resolved;
+  }
+
+  private @Nullable String lookupSynonym(
+      @Nullable String synSchema, String synName) throws SQLException {
+    try {
+      PreparedStatement stmt;
+      if (synSchema == null) {
+        if (resolveSynonymStatement == null) {
+          String sql = "SELECT LOWER(table_schema), LOWER(table_name) FROM all_synonyms"
+              + " WHERE LOWER(synonym_name) = ?"
+              + " ORDER BY CASE WHEN LOWER(synonym_schema) = ANY(pg_catalog.current_schemas(false)) THEN 0"
+              + "               WHEN UPPER(synonym_schema) = 'PUBLIC' THEN 1"
+              + "               ELSE 2 END"
+              + " LIMIT 1";
+          resolveSynonymStatement = conn.prepareStatement(sql);
+        }
+        resolveSynonymStatement.setString(1, synName);
+        stmt = resolveSynonymStatement;
+      } else {
+        if (resolveSynonymQualifiedStatement == null) {
+          String sql = "SELECT LOWER(table_schema), LOWER(table_name) FROM all_synonyms"
+              + " WHERE LOWER(synonym_schema) = ? AND LOWER(synonym_name) = ? LIMIT 1";
+          resolveSynonymQualifiedStatement = conn.prepareStatement(sql);
+        }
+        resolveSynonymQualifiedStatement.setString(1, synSchema);
+        resolveSynonymQualifiedStatement.setString(2, synName);
+        stmt = resolveSynonymQualifiedStatement;
+      }
+      if (!((BaseStatement) stmt).executeWithFlags(QueryExecutor.QUERY_SUPPRESS_BEGIN)) {
         return null;
       }
-      ResultSet rs = castNonNull(resolveSynonymStatement.getResultSet());
+      ResultSet rs = castNonNull(stmt.getResultSet());
       String resolved = null;
-      if (rs.next()) {
-        resolved = rs.getString(1);
+      try {
+        if (rs.next()) {
+          String tableSchema = rs.getString(1);
+          String tableName = rs.getString(2);
+          if (tableName != null && !tableName.isEmpty()) {
+            resolved = (tableSchema != null && !tableSchema.isEmpty())
+                ? quoteIdent(tableSchema) + "." + quoteIdent(tableName)
+                : quoteIdent(tableName);
+          }
+        }
+      } finally {
+        rs.close();
       }
-      rs.close();
       return resolved;
     } catch (SQLException e) {
-      // all_synonyms view doesn't exist — disable synonym lookup permanently
+      // all_synonyms view doesn't exist or inaccessible — disable synonym lookup permanently
       synonymLookupSupported = false;
       return null;
     }
@@ -733,6 +1025,20 @@ public class TypeInfoCache implements TypeInfo {
     }
   }
 
+  private static boolean isSimpleLowerIdent(String ident) {
+    return ident.equals(ident.toLowerCase(Locale.ROOT)) && ident.indexOf('.') == -1;
+  }
+
+  private String cachePackageTypeName(int typeOid, String pkgSchema, String schema, String name) {
+    String fullName = formatQualifiedName(pkgSchema, schema, name);
+    if (isSimpleLowerIdent(pkgSchema) && isSimpleLowerIdent(schema) && isSimpleLowerIdent(name)) {
+      pgNameToOid.put(pkgSchema + "." + schema + "." + name, typeOid);
+    }
+    pgNameToOid.put(fullName, typeOid);
+    oidToPgName.put(typeOid, fullName);
+    return fullName;
+  }
+
   public @Nullable String getPGType(int oid) throws SQLException {
     try (ResourceLock ignore = lock.obtain()) {
       if (oid == Oid.UNSPECIFIED) {
@@ -745,7 +1051,8 @@ public class TypeInfoCache implements TypeInfo {
         return pgTypeName;
       }
 
-      PreparedStatement getNameStatement = prepareGetNameStatement();
+      boolean hasPkgSupport = hasPackageNamespaceSupport();
+      PreparedStatement getNameStatement = prepareGetNameStatement(hasPkgSupport);
 
       getNameStatement.setInt(1, oid);
 
@@ -759,21 +1066,25 @@ public class TypeInfoCache implements TypeInfo {
         boolean onPath = rs.getBoolean(1);
         String schema = castNonNull(rs.getString(2), "schema");
         String name = castNonNull(rs.getString(3), "name");
-        if (onPath) {
-          pgTypeName = name;
-          pgNameToOid.put(schema + "." + name, oid);
+        String pkgSchema = hasPkgSupport ? rs.getString(4) : null;
+        if (pkgSchema != null) {
+          pgTypeName = cachePackageTypeName(oid, pkgSchema, schema, name);
         } else {
-          // TODO: escaping !?
-          pgTypeName = "\"" + schema + "\".\"" + name + "\"";
-          // if all is lowercase add special type info
-          // TODO: should probably check for all special chars
-          if (schema.equals(schema.toLowerCase(Locale.ROOT)) && schema.indexOf('.') == -1
-              && name.equals(name.toLowerCase(Locale.ROOT)) && name.indexOf('.') == -1) {
+          if (onPath) {
+            pgTypeName = name;
             pgNameToOid.put(schema + "." + name, oid);
+          } else {
+            // TODO: escaping !?
+            pgTypeName = "\"" + schema + "\".\"" + name + "\"";
+            // if all is lowercase add special type info
+            // TODO: should probably check for all special chars
+            if (isSimpleLowerIdent(schema) && isSimpleLowerIdent(name)) {
+              pgNameToOid.put(schema + "." + name, oid);
+            }
           }
+          pgNameToOid.put(pgTypeName, oid);
+          oidToPgName.put(oid, pgTypeName);
         }
-        pgNameToOid.put(pgTypeName, oid);
-        oidToPgName.put(oid, pgTypeName);
       }
       rs.close();
 
@@ -781,13 +1092,21 @@ public class TypeInfoCache implements TypeInfo {
     }
   }
 
-  private PreparedStatement prepareGetNameStatement() throws SQLException {
+  private PreparedStatement prepareGetNameStatement(boolean hasPkgSupport) throws SQLException {
     PreparedStatement getNameStatement = this.getNameStatement;
     if (getNameStatement == null) {
       String sql;
-      sql = "SELECT n.nspname = ANY(current_schemas(true)), n.nspname, t.typname "
+      if (hasPkgSupport) {
+        sql = "SELECT n.nspname = ANY(current_schemas(true)), n.nspname, t.typname, p.nspname "
+            + "FROM pg_catalog.pg_type t "
+            + "JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid "
+            + "LEFT JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid "
+            + "WHERE t.oid = ?";
+      } else {
+        sql = "SELECT n.nspname = ANY(current_schemas(true)), n.nspname, t.typname "
             + "FROM pg_catalog.pg_type t "
             + "JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid WHERE t.oid = ?";
+      }
 
       this.getNameStatement = getNameStatement = conn.prepareStatement(sql);
     }
@@ -796,7 +1115,23 @@ public class TypeInfoCache implements TypeInfo {
 
   public int getPGArrayType(@Nullable String elementTypeName) throws SQLException {
     elementTypeName = getTypeForAlias(elementTypeName);
+    if (elementTypeName == null) {
+      return Oid.UNSPECIFIED;
+    }
 
+    int oid = resolveArrayType(elementTypeName);
+    if (oid == Oid.UNSPECIFIED && elementTypeName.contains("\"")) {
+      // POLAR: Support Oracle-style quoted uppercase names (e.g. "\"CAS\".\"PKG\".\"TBL\"")
+      // only after exact-case quoted lookup finds nothing.
+      String lcName = elementTypeName.toLowerCase(Locale.ROOT);
+      if (!lcName.equals(elementTypeName)) {
+        oid = resolveArrayType(lcName);
+      }
+    }
+    return oid;
+  }
+
+  private int resolveArrayType(String elementTypeName) throws SQLException {
     // POLAR: First try to find a PolarDB collection type for this element type.
     // PolarDB supports VARRAY ('J'), nested table/TABLE OF ('K'), and associative
     // array/INDEX BY ('L'). These Oracle-compatible collection types should be
@@ -839,7 +1174,8 @@ public class TypeInfoCache implements TypeInfo {
    */
   private int findCollectionTypeByElement(int elemOid) throws SQLException {
     try (ResourceLock ignore = lock.obtain()) {
-      PreparedStatement stmt = prepareFindCollectionByElementStmt();
+      boolean hasPkgSupport = hasPackageNamespaceSupport();
+      PreparedStatement stmt = prepareFindCollectionByElementStmt(hasPkgSupport);
       stmt.setInt(1, elemOid);
 
       if (!((BaseStatement) stmt).executeWithFlags(QueryExecutor.QUERY_SUPPRESS_BEGIN)) {
@@ -859,16 +1195,34 @@ public class TypeInfoCache implements TypeInfo {
     }
   }
 
-  private PreparedStatement prepareFindCollectionByElementStmt() throws SQLException {
+  private PreparedStatement prepareFindCollectionByElementStmt(boolean hasPkgSupport)
+      throws SQLException {
     PreparedStatement stmt = this.findCollectionByElementStmt;
     if (stmt == null) {
       // Only find collection types whose element is a composite type (typcategory='C').
       // J = VARRAY, K = Nested Table (TABLE OF), L = Associative Array (INDEX BY)
-      String sql = "SELECT ct.oid, ct.typname FROM pg_catalog.pg_type ct"
-          + " JOIN pg_catalog.pg_type et ON ct.typelem = et.oid"
-          + " WHERE ct.typelem = ? AND ct.typcategory IN ('J','K','L')"
-          + " AND et.typcategory = 'C'"
-          + " ORDER BY ct.oid LIMIT 1";
+      String sql;
+      if (hasPkgSupport) {
+        sql = "SELECT ct.oid, "
+            + "CASE WHEN p.nspname IS NOT NULL THEN "
+            + "'\"' || replace(p.nspname, '\"', '\"\"') || '\".\"' "
+            + "|| replace(n.nspname, '\"', '\"\"') || '\".\"' "
+            + "|| replace(ct.typname, '\"', '\"\"') || '\"' "
+            + "ELSE ct.typname END "
+            + "FROM pg_catalog.pg_type ct "
+            + "JOIN pg_catalog.pg_type et ON ct.typelem = et.oid "
+            + "JOIN pg_catalog.pg_namespace n ON ct.typnamespace = n.oid "
+            + "LEFT JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid "
+            + "WHERE ct.typelem = ? AND ct.typcategory IN ('J','K','L') "
+            + "AND et.typcategory = 'C' "
+            + "ORDER BY ct.oid LIMIT 1";
+      } else {
+        sql = "SELECT ct.oid, ct.typname FROM pg_catalog.pg_type ct"
+            + " JOIN pg_catalog.pg_type et ON ct.typelem = et.oid"
+            + " WHERE ct.typelem = ? AND ct.typcategory IN ('J','K','L')"
+            + " AND et.typcategory = 'C'"
+            + " ORDER BY ct.oid LIMIT 1";
+      }
       this.findCollectionByElementStmt = stmt = conn.prepareStatement(sql);
     }
     return stmt;
@@ -958,7 +1312,9 @@ public class TypeInfoCache implements TypeInfo {
         return pgType;
       }
 
-      PreparedStatement getArrayElementOidStatement = prepareGetArrayElementOidStatement();
+      boolean hasPkgSupport = hasPackageNamespaceSupport();
+      PreparedStatement getArrayElementOidStatement =
+          prepareGetArrayElementOidStatement(hasPkgSupport);
 
       getArrayElementOidStatement.setInt(1, oid);
 
@@ -974,7 +1330,7 @@ public class TypeInfoCache implements TypeInfo {
         /* POLAR: The standard typelem JOIN returned no rows. This happens for
          * PolarDB TABLE OF types whose typelem=0. Try the reverse lookup:
          * find the element type whose typarray column points to this OID. */
-        PreparedStatement fallbackStmt = prepareGetArrayElementByTyparrayStatement();
+        PreparedStatement fallbackStmt = prepareGetArrayElementByTyparrayStatement(hasPkgSupport);
         fallbackStmt.setInt(1, oid);
         if (!((BaseStatement) fallbackStmt)
             .executeWithFlags(QueryExecutor.QUERY_SUPPRESS_BEGIN)) {
@@ -988,17 +1344,22 @@ public class TypeInfoCache implements TypeInfo {
 
       pgType = (int) rs.getLong(1);
       boolean onPath = rs.getBoolean(2);
-      String schema = rs.getString(3);
+      String schema = castNonNull(rs.getString(3), "schema");
       String name = castNonNull(rs.getString(4));
+      String pkgSchema = hasPkgSupport ? rs.getString(5) : null;
       pgArrayToPgType.put(oid, pgType);
-      pgNameToOid.put(schema + "." + name, pgType);
-      String fullName = "\"" + schema + "\".\"" + name + "\"";
-      pgNameToOid.put(fullName, pgType);
-      if (onPath && name.equals(name.toLowerCase(Locale.ROOT))) {
-        oidToPgName.put(pgType, name);
-        pgNameToOid.put(name, pgType);
+      if (pkgSchema != null) {
+        cachePackageTypeName(pgType, pkgSchema, schema, name);
       } else {
-        oidToPgName.put(pgType, fullName);
+        pgNameToOid.put(schema + "." + name, pgType);
+        String fullName = "\"" + schema + "\".\"" + name + "\"";
+        pgNameToOid.put(fullName, pgType);
+        if (onPath && name.equals(name.toLowerCase(Locale.ROOT))) {
+          oidToPgName.put(pgType, name);
+          pgNameToOid.put(name, pgType);
+        } else {
+          oidToPgName.put(pgType, fullName);
+        }
       }
 
       rs.close();
@@ -1007,13 +1368,22 @@ public class TypeInfoCache implements TypeInfo {
     }
   }
 
-  private PreparedStatement prepareGetArrayElementOidStatement() throws SQLException {
+  private PreparedStatement prepareGetArrayElementOidStatement(boolean hasPkgSupport)
+      throws SQLException {
     PreparedStatement getArrayElementOidStatement = this.getArrayElementOidStatement;
     if (getArrayElementOidStatement == null) {
       String sql;
-      sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname "
+      if (hasPkgSupport) {
+        sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname, "
+            + "p.nspname "
+            + "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_type e ON t.typelem = e.oid "
+            + "JOIN pg_catalog.pg_namespace n ON e.typnamespace = n.oid "
+            + "LEFT JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid WHERE t.oid = ?";
+      } else {
+        sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname "
             + "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_type e ON t.typelem = e.oid "
             + "JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid WHERE t.oid = ?";
+      }
       this.getArrayElementOidStatement = getArrayElementOidStatement = conn.prepareStatement(sql);
     }
     return getArrayElementOidStatement;
@@ -1025,13 +1395,24 @@ public class TypeInfoCache implements TypeInfo {
    * relationship: find the element type whose {@code typarray} points to
    * the given array-type OID.
    */
-  private PreparedStatement prepareGetArrayElementByTyparrayStatement() throws SQLException {
+  private PreparedStatement prepareGetArrayElementByTyparrayStatement(boolean hasPkgSupport)
+      throws SQLException {
     PreparedStatement stmt = this.getArrayElementByTyparrayStatement;
     if (stmt == null) {
-      String sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname "
-          + "FROM pg_catalog.pg_type e "
-          + "JOIN pg_catalog.pg_namespace n ON e.typnamespace = n.oid "
-          + "WHERE e.typarray = ?";
+      String sql;
+      if (hasPkgSupport) {
+        sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname, "
+            + "p.nspname "
+            + "FROM pg_catalog.pg_type e "
+            + "JOIN pg_catalog.pg_namespace n ON e.typnamespace = n.oid "
+            + "LEFT JOIN pg_catalog.pg_namespace p ON n.nsppkgns = p.oid "
+            + "WHERE e.typarray = ?";
+      } else {
+        sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname "
+            + "FROM pg_catalog.pg_type e "
+            + "JOIN pg_catalog.pg_namespace n ON e.typnamespace = n.oid "
+            + "WHERE e.typarray = ?";
+      }
       this.getArrayElementByTyparrayStatement = stmt = conn.prepareStatement(sql);
     }
     return stmt;
