@@ -100,8 +100,8 @@ public class TypeInfoCache implements TypeInfo {
   private @Nullable PreparedStatement resolveSynonymStatement;
   private @Nullable PreparedStatement resolveSynonymQualifiedStatement;
   private @Nullable PreparedStatement checkAllSynonymsStatement;
-  private @Nullable Boolean allSynonymsPresent;
-  private boolean synonymLookupSupported = true; // set to false if all_synonyms doesn't exist
+  private boolean allSynonymsPresent;
+  private boolean synonymLookupSupported = true; // set to false on structural sys.all_synonyms errors
   private static final int MAX_SYNONYM_DEPTH = 4;
   // POLAR: composite type OID -> field type OIDs (ordered by attnum). Cache for
   // getCompositeFieldTypeOids so composite record fields can be type-restored.
@@ -546,12 +546,9 @@ public class TypeInfoCache implements TypeInfo {
     return "\"" + ident.replace("\"", "\"\"") + "\"";
   }
 
-  private static String formatQualifiedName(
-      @Nullable String pkgSchema, String schema, String name) {
-    if (pkgSchema != null) {
-      return quoteIdent(pkgSchema) + "." + quoteIdent(schema) + "." + quoteIdent(name);
-    }
-    return quoteIdent(schema) + "." + quoteIdent(name);
+  private static String formatPackageQualifiedName(
+      String pkgSchema, String schema, String name) {
+    return quoteIdent(pkgSchema) + "." + quoteIdent(schema) + "." + quoteIdent(name);
   }
 
   private PreparedStatement prepareNoMatchStatement() throws SQLException {
@@ -605,10 +602,10 @@ public class TypeInfoCache implements TypeInfo {
         + "     JOIN ("
         + "       SELECT s.r, (pg_catalog.current_schemas(false))[s.r] AS nspname"
         + "         FROM pg_catalog.generate_series(1, pg_catalog.array_upper(pg_catalog.current_schemas(false), 1)) AS s(r)"
-        + "     ) AS r ON ns.nspname = r.nspname AND ns.nsppkgns = 0"
+        + "     ) AS r ON ns.nspname = r.nspname AND COALESCE(ns.nsppkgns, 0) = 0"
         + " ) AS sp ON sp.nspoid = p.oid";
     String orderBy =
-        " ORDER BY CASE WHEN n.nsppkgns = 0 THEN 0"
+        " ORDER BY CASE WHEN COALESCE(n.nsppkgns, 0) = 0 THEN 0"
         + "              WHEN sp.r IS NOT NULL THEN 1"
         + "              ELSE 2 END,"
         + "          sp.r,"
@@ -806,12 +803,22 @@ public class TypeInfoCache implements TypeInfo {
     if (!synonymLookupSupported) {
       return false;
     }
-    if (allSynonymsPresent != null) {
-      return allSynonymsPresent;
+    if (allSynonymsPresent) {
+      return true;
     }
     if (checkAllSynonymsStatement == null) {
       checkAllSynonymsStatement = conn.prepareStatement(
-          "SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'all_synonyms' LIMIT 1");
+          "SELECT 1 FROM pg_catalog.pg_class c"
+          + " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+          + " WHERE n.nspname = 'sys'"
+          + " AND c.relname = 'all_synonyms'"
+          + " AND c.relkind IN ('r', 'v', 'm', 'p')"
+          + " AND pg_catalog.has_table_privilege(c.oid, 'SELECT')"
+          + " AND 4 = (SELECT COUNT(*) FROM pg_catalog.pg_attribute a"
+          + "   WHERE a.attrelid = c.oid"
+          + "   AND a.attname IN ('synonym_name', 'synonym_schema', 'table_schema', 'table_name')"
+          + "   AND NOT a.attisdropped)"
+          + " LIMIT 1");
     }
     boolean present = false;
     if (((BaseStatement) checkAllSynonymsStatement)
@@ -823,16 +830,15 @@ public class TypeInfoCache implements TypeInfo {
         rs.close();
       }
     }
-    allSynonymsPresent = present;
-    if (!present) {
-      synonymLookupSupported = false;
+    if (present) {
+      allSynonymsPresent = true;
     }
     return present;
   }
 
   /**
    * POLAR: Resolve a synonym name (or synonym-qualified package type name)
-   * to the real type name it points to using {@code all_synonyms}.
+   * to the real type name it points to using {@code sys.all_synonyms}.
    *
    * @param synonymName the type or synonym name to resolve
    * @return the real type name, or null if not a synonym / view unavailable
@@ -878,9 +884,10 @@ public class TypeInfoCache implements TypeInfo {
       PreparedStatement stmt;
       if (synSchema == null) {
         if (resolveSynonymStatement == null) {
-          String sql = "SELECT LOWER(table_schema), LOWER(table_name) FROM all_synonyms"
+          String sql = "SELECT LOWER(table_schema), LOWER(table_name) FROM sys.all_synonyms"
               + " WHERE LOWER(synonym_name) = ?"
-              + " ORDER BY CASE WHEN LOWER(synonym_schema) = ANY(pg_catalog.current_schemas(false)) THEN 0"
+              + " ORDER BY CASE WHEN LOWER(synonym_schema) = ANY(pg_catalog.current_schemas(false))"
+              + "               THEN 0"
               + "               WHEN UPPER(synonym_schema) = 'PUBLIC' THEN 1"
               + "               ELSE 2 END"
               + " LIMIT 1";
@@ -890,7 +897,7 @@ public class TypeInfoCache implements TypeInfo {
         stmt = resolveSynonymStatement;
       } else {
         if (resolveSynonymQualifiedStatement == null) {
-          String sql = "SELECT LOWER(table_schema), LOWER(table_name) FROM all_synonyms"
+          String sql = "SELECT LOWER(table_schema), LOWER(table_name) FROM sys.all_synonyms"
               + " WHERE LOWER(synonym_schema) = ? AND LOWER(synonym_name) = ? LIMIT 1";
           resolveSynonymQualifiedStatement = conn.prepareStatement(sql);
         }
@@ -918,8 +925,18 @@ public class TypeInfoCache implements TypeInfo {
       }
       return resolved;
     } catch (SQLException e) {
-      // all_synonyms view doesn't exist or inaccessible — disable synonym lookup permanently
-      synonymLookupSupported = false;
+      String sqlState = e.getSQLState();
+      if ("42P01".equals(sqlState) || "42703".equals(sqlState) || "42883".equals(sqlState)) {
+        // Missing sys.all_synonyms, expected column, or helper function — disable permanently
+        synonymLookupSupported = false;
+        LOGGER.log(Level.WARNING,
+            "Disabling Oracle synonym lookup for this connection (SQLState={0}): {1}",
+            new Object[]{sqlState, e.getMessage()});
+      } else {
+        LOGGER.log(Level.FINE,
+            "Ignoring transient error during Oracle synonym lookup (SQLState={0}): {1}",
+            new Object[]{sqlState, e.getMessage()});
+      }
       return null;
     }
   }
@@ -1030,7 +1047,7 @@ public class TypeInfoCache implements TypeInfo {
   }
 
   private String cachePackageTypeName(int typeOid, String pkgSchema, String schema, String name) {
-    String fullName = formatQualifiedName(pkgSchema, schema, name);
+    String fullName = formatPackageQualifiedName(pkgSchema, schema, name);
     if (isSimpleLowerIdent(pkgSchema) && isSimpleLowerIdent(schema) && isSimpleLowerIdent(name)) {
       pgNameToOid.put(pkgSchema + "." + schema + "." + name, typeOid);
     }
@@ -1382,7 +1399,7 @@ public class TypeInfoCache implements TypeInfo {
       } else {
         sql = "SELECT e.oid, n.nspname = ANY(current_schemas(true)), n.nspname, e.typname "
             + "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_type e ON t.typelem = e.oid "
-            + "JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid WHERE t.oid = ?";
+            + "JOIN pg_catalog.pg_namespace n ON e.typnamespace = n.oid WHERE t.oid = ?";
       }
       this.getArrayElementOidStatement = getArrayElementOidStatement = conn.prepareStatement(sql);
     }

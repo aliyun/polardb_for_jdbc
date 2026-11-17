@@ -177,9 +177,10 @@ public class ThreePartPackageTypeTest {
           + "  TYPE TBL_CRR_CALLBACK_RESULT IS TABLE OF REC_CRR_CALLBACK_RESULT;\n"
           + "END pkg_crr;");
 
-      // Optional synonym pointing to schemaA.pkg_crr
+      // Optional synonym pointing to schemaA.pkg_crr (created in public so tearDown drops it cleanly)
       try {
-        stmt.execute("CREATE OR REPLACE SYNONYM " + pkgSynName + " FOR " + schemaA + ".pkg_crr");
+        stmt.execute(
+            "CREATE OR REPLACE SYNONYM public." + pkgSynName + " FOR " + schemaA + ".pkg_crr");
         synonymCreated = true;
       } catch (SQLException ignored) {
         synonymCreated = false;
@@ -198,7 +199,7 @@ public class ThreePartPackageTypeTest {
     try (Statement stmt = conn.createStatement()) {
       if (synonymCreated) {
         try {
-          stmt.execute("DROP SYNONYM IF EXISTS " + pkgSynName);
+          stmt.execute("DROP SYNONYM public." + pkgSynName);
         } catch (SQLException ignored) {
           // ignore
         }
@@ -416,6 +417,36 @@ public class ThreePartPackageTypeTest {
       cs.registerOutParameter(4, Types.VARCHAR);
       cs.execute();
       assertEquals("NESTED_OK:2026-11-13:5:2:IFP-POL-109947987", cs.getString(4));
+    }
+  }
+
+  @Test
+  public void testPackageSynonymNotHijackedByTempAllSynonyms() throws Exception {
+    if (!synonymCreated) {
+      return;
+    }
+    Properties props = new Properties();
+    props.put("callFunctionMode", "true");
+    try (Connection freshConn = TestUtil.openDB(props)) {
+      freshConn.setAutoCommit(false);
+      try (Statement stmt = freshConn.createStatement()) {
+        // Shadow unqualified "all_synonyms" with a temp table lacking expected columns;
+        // driver must probe and query sys.all_synonyms directly without aborting the tx.
+        stmt.execute("CREATE TEMP TABLE all_synonyms (dummy integer)");
+      }
+      Array arr = freshConn.createArrayOf(
+          pkgSynName.toUpperCase(Locale.ROOT) + ".TBL_CRR_CALLBACK_RESULT", sampleRows());
+      assertNotNull(arr);
+      try (CallableStatement cs = freshConn.prepareCall(
+          "{ call " + schemaA + ".pkg_crr.upd_crr_callback_result(?, ?, ?, ?) }")) {
+        cs.setDate(1, Date.valueOf("2026-11-13"));
+        cs.setString(2, "6");
+        cs.setArray(3, arr);
+        cs.registerOutParameter(4, Types.VARCHAR);
+        cs.execute();
+        assertEquals("NESTED_OK:2026-11-13:6:2:IFP-POL-109947987", cs.getString(4));
+      }
+      freshConn.rollback();
     }
   }
 
